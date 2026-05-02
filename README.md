@@ -4,7 +4,7 @@ This repository contains a Python wrapper script for batch encoding video files 
 
 ## Files
 
-- `AV1-SVT-New-argparse.py` - batch encoding script with scaling, CRF, SVT preset, film grain, and subtitle preservation.
+- `AV1-SVT.py` - batch encoding script with scaling, CRF, SVT preset, film grain, and subtitle preservation.
 
 ## Requirements
 
@@ -19,13 +19,13 @@ This repository contains a Python wrapper script for batch encoding video files 
 Basic usage:
 
 ```bash
-python3 AV1-SVT-New-argparse.py /path/to/input.mp4 /path/to/output_dir
+python3 AV1-SVT.py /path/to/input.mp4 /path/to/output_dir
 ```
 
 Example:
 
 ```bash
-python3 AV1-SVT-New-argparse.py --scale 720 --crf 32 --preset-svt 8 --film-grain 10 /path/to/input.mkv /path/to/output_dir
+python3 AV1-SVT.py --scale 720 --crf 32 --preset-svt 8 --film-grain 10 /path/to/input.mkv /path/to/output_dir
 ```
 
 ## Options
