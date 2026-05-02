@@ -28,6 +28,10 @@ Example:
 python3 AV1-SVT.py --scale 720 --crf 32 --preset-svt 8 --film-grain 10 /path/to/input.mkv /path/to/output_dir
 ```
 
+## Screenshot
+
+![AV1 Batch Encoding Screenshot](screenshot.png)
+
 ## Options
 
 - `--pin-cores` / `--no-pin-cores` - Enable or disable CPU core pinning for the encoding process.
