@@ -78,9 +78,9 @@ def parse_arguments():
         description="Encode video to AV1 using SVT-AV1 with optional CPU core pinning and scaling.",
         formatter_class=ArgumentDefaultsAndRawHelpFormatter,
         epilog="""Examples:
-  AV1-SVT-New-argparse.py /path/to/input.mp4 /path/to/output_dir
-  AV1-SVT-New-argparse.py /path/to/source_dir /path/to/dest_dir --scale 720 --crf 32 --preset-svt 8
-  AV1-SVT-New-argparse.py /path/to/input.mkv /path/to/output --no-pin-cores --film-grain 10
+  AV1-SVT.py /path/to/input.mp4 /path/to/output_dir
+  AV1-SVT.py /path/to/source_dir /path/to/dest_dir --scale 720 --crf 32 --preset-svt 8
+  AV1-SVT.py /path/to/input.mkv /path/to/output --no-pin-cores --film-grain 10
 """
     )
     parser.add_argument('source', help='Single video file or directory containing video files.')
