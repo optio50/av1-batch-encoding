@@ -39,13 +39,13 @@ SCALE = 0
 # Higher CRF values will result in a final output that takes less space
 # but begins to lose detail. Lower CRF values retain more detail at the cost of larger file sizes.
 # Range (1-70)
-CRF = 35
+CRF = 38
 #================================================
 # This preset parameter governs the efficiency/encode-time trade-off. Lower presets will result in an output
 # with better quality for a given file size, but will take longer to encode.
 # Higher presets can result in a very fast encode, but will make some compromises on visual quality for a given crf value.
 # Range (0-13)
-PRESET_SVT = 8
+PRESET_SVT = 9
 #================================================
 # Film Grain Synthesis: model and remove grain from source, store as metadata,
 # decoder re-adds it. Reduces file size 10-30% on live-action/grainy content.
@@ -74,13 +74,37 @@ def parse_arguments():
             return ivalue
         return _type
 
+    def parse_size(value):
+        """Parse a human-readable size string into bytes.
+        Accepts plain numbers (treated as MB) or suffixes: K/KB, M/MB, G/GB, T/TB.
+        Examples: 500, 500M, 1.5G, 2GB, 700K"""
+        value = value.strip()
+        suffixes = {
+            'T': 1024**4, 'TB': 1024**4,
+            'G': 1024**3, 'GB': 1024**3,
+            'M': 1024**2, 'MB': 1024**2,
+            'K': 1024,    'KB': 1024,
+        }
+        upper = value.upper()
+        for suffix, multiplier in sorted(suffixes.items(), key=lambda x: -len(x[0])):
+            if upper.endswith(suffix):
+                try:
+                    return float(value[:-len(suffix)]) * multiplier
+                except ValueError:
+                    raise argparse.ArgumentTypeError(f"Invalid size: '{value}'")
+        try:
+            # No suffix — treat as MB
+            return float(value) * 1024**2
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"Invalid size: '{value}'. Use a number with optional suffix K, M, G, T (e.g. 500M, 2G)")
+
     parser = argparse.ArgumentParser(
         description="Encode video to AV1 using SVT-AV1 with optional CPU core pinning and scaling.",
         formatter_class=ArgumentDefaultsAndRawHelpFormatter,
         epilog="""Examples:
-  AV1-SVT.py /path/to/input.mp4 /path/to/output_dir
-  AV1-SVT.py /path/to/source_dir /path/to/dest_dir --scale 720 --crf 32 --preset-svt 8
-  AV1-SVT.py /path/to/input.mkv /path/to/output --no-pin-cores --film-grain 10
+  AV1-SVT-New-argparse.py /path/to/input.mp4 /path/to/output_dir
+  AV1-SVT-New-argparse.py /path/to/source_dir /path/to/dest_dir --scale 720 --crf 32 --preset-svt 8
+  AV1-SVT-New-argparse.py /path/to/input.mkv /path/to/output --no-pin-cores --film-grain 10
 """
     )
     parser.add_argument('source', help='Single video file or directory containing video files.')
@@ -100,6 +124,10 @@ def parse_arguments():
                         help='Film grain synthesis strength (0=disabled, 1-50).')
     parser.add_argument('--depth', type=int, default=DEPTH,
                         help='Directory traversal depth for batch mode. 0 means only top-level files.')
+    parser.add_argument('--min-size', type=parse_size, default=0,
+                        help='Minimum file size. Files smaller than this are skipped in batch mode. '
+                             'Accepts a number (treated as MB) or a suffix: K/KB, M/MB, G/GB, T/TB '
+                             '(e.g. 500, 500M, 1.5G). Default: 0 = no limit.')
     return parser.parse_args()
 
 def _iter_lines_raw(fd):
@@ -281,7 +309,7 @@ def run_ffmpeg_with_size_estimation(cmd, original_duration, original_size, outpu
 
             rt = (f"{int(remaining_secs // 3600):02}:{int((remaining_secs % 3600) // 60):02}:{int(remaining_secs % 60):02}"
                   if remaining_secs is not None else "Calculating...")
-            eta = (time.strftime('%H:%M', time.localtime(time.time() + remaining_secs))
+            eta = (time.strftime('%-I:%M %p', time.localtime(time.time() + remaining_secs))
                    if remaining_secs is not None else "--:--")
 
             bar_width = 30
@@ -372,10 +400,81 @@ def get_video_resolution(file_path):
         print(f"{colors.yellow}Warning: An error occurred while getting video resolution. Using default value.\nError: {e}{colors.reset}")
         return "Unknown"
 
-def get_audio_channels(file_path):
-    """Return the number of channels in the first audio stream (e.g. 2 for stereo, 6 for 5.1)."""
+def find_english_audio_stream(file_path):
+    """Return the audio-relative index of the first English main-feature audio stream.
+
+    Skips tracks whose title contains commentary/supplemental keywords (e.g.
+    'commentary', 'isolated score', '[pi]', etc.).  If every English track looks
+    like a supplemental track, falls back to the first English track found.
+    Falls back to index 0 if no English stream exists at all, or on error.
+    """
+    SUPPLEMENTAL_KEYWORDS = (
+        'commentary',
+        'isolated score',
+        'isolated music',
+        '[pi]',
+        'feature isolated',
+        'music and effects',
+        'm&e',
+        'descriptive audio',
+        'audio description',
+        'visually impaired',
+    )
+
+    def is_supplemental(stream):
+        title = stream.get('tags', {}).get('title', '').lower()
+        return any(kw in title for kw in SUPPLEMENTAL_KEYWORDS)
+
     try:
-        result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_streams', '-select_streams', 'a:0', 
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_streams', '-select_streams', 'a',
+             '-print_format', 'json', file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+        )
+        streams = json.loads(result.stdout).get('streams', [])
+
+        # First pass: English non-supplemental tracks
+        english_fallback = None
+        for idx, stream in enumerate(streams):
+            lang = stream.get('tags', {}).get('language', '').lower()
+            if lang in ('eng', 'en'):
+                if english_fallback is None:
+                    english_fallback = idx          # remember first English track as last-resort
+                if is_supplemental(stream):
+                    title = stream.get('tags', {}).get('title', f'audio index {idx}')
+                    print(f"{colors.yellow}Skipping supplemental audio track: \"{title}\" (audio index {idx}).{colors.reset}")
+                    continue
+                if idx != 0:
+                    print(f"{colors.yellow}Multiple audio tracks found. "
+                          f"Selecting main English audio track (audio index {idx}).{colors.reset}")
+                return idx
+
+        # All English tracks were supplemental – use the first one as a fallback
+        if english_fallback is not None:
+            print(f"{colors.yellow}Warning: All English audio tracks appear supplemental. "
+                  f"Falling back to first English track (audio index {english_fallback}).{colors.reset}")
+            return english_fallback
+
+        # No English track tagged at all – fall back to first track
+        if streams:
+            print(f"{colors.yellow}Warning: No English-tagged audio track found. "
+                  f"Using first audio track.{colors.reset}")
+        return 0
+    except subprocess.TimeoutExpired:
+        print(f"{colors.yellow}Warning: ffprobe timed out finding English audio stream. "
+              f"Defaulting to first audio track.{colors.reset}")
+        return 0
+    except Exception as e:
+        print(f"{colors.yellow}Warning: Could not determine English audio stream. "
+              f"Defaulting to first audio track.\nError: {e}{colors.reset}")
+        return 0
+
+
+def get_audio_channels(file_path, audio_index=0):
+    """Return the number of channels in the specified audio stream (e.g. 2 for stereo, 6 for 5.1)."""
+    try:
+        result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_streams',
+                                 '-select_streams', f'a:{audio_index}',
                                  '-print_format', 'json', file_path],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
         audio_info = json.loads(result.stdout)
@@ -560,7 +659,7 @@ def get_attachment_stream(input_file):
 
 
 def select_audio_settings(audio_channels, scale):
-    """Return the ffmpeg audio settings list based on channel count and output scale."""
+    """Return (ffmpeg_audio_settings_list, track_title) based on channel count and output scale."""
     # ----- 5.1 Opus (high-quality) -----
     if audio_channels >= 6 and scale not in [360, 480, 576]:
         print(f"{colors.yellow}5.1 Audio Detected\n{colors.green}"
@@ -571,7 +670,7 @@ def select_audio_settings(audio_channels, scale):
             '-vbr', 'on',
             '-ac', '6',
             '-filter:a', 'aformat=channel_layouts=5.1',
-        ]
+        ], 'Opus 5.1'
     # ----- Mobile (low-bitrate stereo) -----
     elif scale in [360, 480, 576]:
         print(f"{colors.yellow}Stereo Audio Selected\n{colors.green}Target Video File will have Low bitrate Stereo Opus Audio Stream for Mobile Device{colors.reset}")
@@ -580,7 +679,7 @@ def select_audio_settings(audio_channels, scale):
             '-b:a', '32k',
             '-vbr', 'on',
             '-ac', '2',
-        ]
+        ], 'Opus 2.0'
     # ----- Normal stereo (default) -----
     else:
         print(f"{colors.yellow}Stereo Audio Detected\n{colors.green}Target Video File will have Stereo Opus Audio Stream{colors.reset}")
@@ -589,7 +688,7 @@ def select_audio_settings(audio_channels, scale):
             '-b:a', '128k',
             '-vbr', 'on',
             '-ac', '2',
-        ]
+        ], 'Opus 2.0'
 
 
 def build_video_filter(crop, scale):
@@ -642,7 +741,8 @@ def encode_video(source, dest, filename, file_num=1, total_files=1):
             return
     
         input_res = get_video_resolution(input_file)
-        audio_channels = get_audio_channels(input_file)
+        eng_audio_idx = find_english_audio_stream(input_file)
+        audio_channels = get_audio_channels(input_file, eng_audio_idx)
         video_codec, audio_codec = get_media_info(input_file)
         preserve_subtitles = has_subtitle_streams(input_file)
         file_has_chapters = has_chapters(input_file)
@@ -671,7 +771,7 @@ def encode_video(source, dest, filename, file_num=1, total_files=1):
         elif SCALE == 360:
             print(f"{colors.bgreen}Output Resolution......:\t360p for Mobile Devices{colors.reset}")
         elif SCALE == 0:
-            print(f"{colors.bgreen}Output Resolution......:\tNo Scaling Selected. Output resolution will be the same as input{colors.reset}")
+            print(f"{colors.bgreen}Output Resolution......:\t{input_res} No Scaling Selected.{colors.reset}")
 
         print(f"{colors.Lblue}Input File Size........:\t{format_bytes(input_size)}{colors.reset}")
         print(f"{colors.Lblue}Input Video Codec......:\t{video_codec.upper()}{colors.reset}")
@@ -688,7 +788,7 @@ def encode_video(source, dest, filename, file_num=1, total_files=1):
         start_time = time.time()
         print(f"{colors.orange}Start Time.............:\t{time.strftime('%a %d %b %Y  %r', time.localtime(start_time))}{colors.reset}")
         
-        audio_settings = select_audio_settings(audio_channels, SCALE)
+        audio_settings, audio_title = select_audio_settings(audio_channels, SCALE)
         video_filter = build_video_filter(crop, SCALE)
         subtitle_codecs = get_subtitle_codecs(input_file) if preserve_subtitles else []
         # mov_text / tx3g are MP4-only subtitle formats; MKV requires conversion to srt
@@ -710,7 +810,7 @@ def encode_video(source, dest, filename, file_num=1, total_files=1):
             '-filter_complex', video_filter,
             '-map', '[v]',
 
-            '-map', '0:a:0',    # First audio
+            '-map', f'0:a:{eng_audio_idx}',    # English (or first) audio
             '-map', '0:s?',     # All subtitles (optional)
 
             '-map_metadata', '0',
@@ -754,7 +854,7 @@ def encode_video(source, dest, filename, file_num=1, total_files=1):
         #else:
         #    print(f"{colors.yellow}Warning: No attachment (cover art) stream found in the input file.{colors.reset}")
 
-        cmd += audio_settings + [output_file]
+        cmd += audio_settings + ['-metadata:s:a:0', f'title={audio_title}', output_file]
 
         # Get original duration and size for size prediction
         original_duration = video_duration if isinstance(video_duration, float) else 0
@@ -930,8 +1030,13 @@ def main():
             print(f"{colors.red}Batch mode for directory encoding (AV1-SVT){colors.yellow} CPU Core Pinning is Active, Cores {CPU_CORE_PINNING}{colors.reset}")
         else:
             print(f"{colors.red}Batch mode for directory encoding (AV1-SVT){colors.yellow} CPU Core Pinning is NOT Active{colors.reset}")
+        min_bytes = args.min_size  # already in bytes after parse_size
         if args.depth == 0:
-            files = [f for f in os.listdir(source) if f.lower().endswith(('.avi', '.mp4', '.mkv', '.webm', '.flv', '.mov', '.wmv', '.m4v'))]
+            files = [
+                f for f in os.listdir(source)
+                if f.lower().endswith(('.avi', '.mp4', '.mkv', '.webm', '.flv', '.mov', '.wmv', '.m4v'))
+                and os.path.getsize(os.path.join(source, f)) >= min_bytes
+            ]
         else:
             root_depth = source.rstrip(os.path.sep).count(os.path.sep)
             files = []
@@ -942,12 +1047,23 @@ def main():
                     continue
                 for f in filenames:
                     if f.lower().endswith(('.avi', '.mp4', '.mkv', '.webm', '.flv', '.mov', '.wmv', '.m4v')):
-                        rel_path = os.path.relpath(os.path.join(root, f), source)
-                        files.append(rel_path)
+                        full_path = os.path.join(root, f)
+                        if os.path.getsize(full_path) >= min_bytes:
+                            rel_path = os.path.relpath(full_path, source)
+                            files.append(rel_path)
         files.sort()
         total_files = len(files) # Get the total number of files
         print(f"{colors.Bogreen}Files to be processed{colors.reset}")
-        print('\n'.join(files))
+        def fmt_size(num_bytes):
+            for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+                if num_bytes < 1024 or unit == 'TB':
+                    return f"{num_bytes:.2f} {unit}"
+                num_bytes /= 1024
+        file_sizes = [(f, fmt_size(os.path.getsize(os.path.join(source, f)))) for f in files]
+        col_width = max(len(f) for f, _ in file_sizes)
+        size_width = max(len(s) for _, s in file_sizes)
+        for f, size_str in file_sizes:
+            print(f"{colors.white}{f:<{col_width}}  {colors.skyblue}{size_str:>{size_width}}{colors.reset}")
         print('=' * 80)
     
     elif os.path.isfile(source) and os.path.isdir(dest):
